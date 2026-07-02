@@ -31,10 +31,12 @@ def upgrade() -> None:
                 nullable=True,
             )
         )
-        # Create index for efficient dashboard queries
+        # Create index for efficient dashboard queries.
+        # Columns must be a list: newer alembic versions iterate a bare string
+        # character by character, breaking fresh-DB upgrades on SQLite.
         batch_op.create_index(
             'ix_conversation_metadata_execution_status',
-            'execution_status',
+            ['execution_status'],
             unique=False,
         )
 

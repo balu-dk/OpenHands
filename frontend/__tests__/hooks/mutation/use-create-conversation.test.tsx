@@ -93,6 +93,9 @@ describe("useCreateConversation", () => {
         undefined,
         undefined,
         undefined, // plugins
+        undefined, // sandbox_id
+        undefined, // llm_model
+        undefined, // agent_settings_diff
       );
     });
   });

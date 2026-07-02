@@ -24,6 +24,7 @@ import {
   SandboxGroupingStrategy,
   SandboxGroupingStrategyOptions,
 } from "#/types/settings";
+import { requestBrowserNotificationPermission } from "#/utils/browser-notifications";
 import { createPermissionGuard } from "#/utils/org/permission-guard";
 import { useSandboxSpecs } from "#/hooks/query/use-sandbox-specs";
 
@@ -48,6 +49,10 @@ function AppSettingsScreen() {
   const [
     soundNotificationsSwitchHasChanged,
     setSoundNotificationsSwitchHasChanged,
+  ] = React.useState(false);
+  const [
+    browserNotificationsSwitchHasChanged,
+    setBrowserNotificationsSwitchHasChanged,
   ] = React.useState(false);
   const [
     proactiveConversationsSwitchHasChanged,
@@ -88,6 +93,8 @@ function AppSettingsScreen() {
       formData.get("enable-analytics-switch")?.toString() === "on";
     const enableSoundNotifications =
       formData.get("enable-sound-notifications-switch")?.toString() === "on";
+    const enableBrowserNotifications =
+      formData.get("enable-browser-notifications-switch")?.toString() === "on";
 
     const enableProactiveConversations =
       formData.get("enable-proactive-conversations-switch")?.toString() ===
@@ -125,6 +132,7 @@ function AppSettingsScreen() {
         language,
         user_consents_to_analytics: enableAnalytics,
         enable_sound_notifications: enableSoundNotifications,
+        enable_browser_notifications: enableBrowserNotifications,
         enable_proactive_conversation_starters: enableProactiveConversations,
         enable_solvability_analysis: enableSolvabilityAnalysis,
         sandbox_grouping_strategy: sandboxGroupingStrategy,
@@ -147,6 +155,7 @@ function AppSettingsScreen() {
           setLanguageInputHasChanged(false);
           setAnalyticsSwitchHasChanged(false);
           setSoundNotificationsSwitchHasChanged(false);
+          setBrowserNotificationsSwitchHasChanged(false);
           setProactiveConversationsSwitchHasChanged(false);
           setSandboxGroupingStrategyHasChanged(false);
           setSelectedSandboxGroupingStrategy(null);
@@ -183,6 +192,19 @@ function AppSettingsScreen() {
     setSoundNotificationsSwitchHasChanged(
       checked !== currentSoundNotifications,
     );
+  };
+
+  const checkIfBrowserNotificationsSwitchHasChanged = (checked: boolean) => {
+    const currentBrowserNotifications =
+      !!settings?.enable_browser_notifications;
+    setBrowserNotificationsSwitchHasChanged(
+      checked !== currentBrowserNotifications,
+    );
+    // Ask for OS-level permission up front so the first notification isn't
+    // silently dropped. Denial is fine — the setting simply has no effect.
+    if (checked) {
+      requestBrowserNotificationPermission();
+    }
   };
 
   const checkIfProactiveConversationsSwitchHasChanged = (checked: boolean) => {
@@ -241,6 +263,7 @@ function AppSettingsScreen() {
     !languageInputHasChanged &&
     !analyticsSwitchHasChanged &&
     !soundNotificationsSwitchHasChanged &&
+    !browserNotificationsSwitchHasChanged &&
     !proactiveConversationsSwitchHasChanged &&
     !solvabilityAnalysisSwitchHasChanged &&
     !sandboxGroupingStrategyHasChanged &&
@@ -283,6 +306,15 @@ function AppSettingsScreen() {
             onToggle={checkIfSoundNotificationsSwitchHasChanged}
           >
             {t(I18nKey.SETTINGS$SOUND_NOTIFICATIONS)}
+          </SettingsSwitch>
+
+          <SettingsSwitch
+            testId="enable-browser-notifications-switch"
+            name="enable-browser-notifications-switch"
+            defaultIsToggled={!!settings.enable_browser_notifications}
+            onToggle={checkIfBrowserNotificationsSwitchHasChanged}
+          >
+            {t(I18nKey.SETTINGS$BROWSER_NOTIFICATIONS)}
           </SettingsSwitch>
 
           {config?.app_mode === "saas" && (

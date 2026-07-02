@@ -102,6 +102,13 @@ class StoredConversationMetadata(Base):
     llm_model: Mapped[str | None] = mapped_column(String, nullable=True)
     agent_kind: Mapped[str | None] = mapped_column(String, nullable=True)
 
+    # Per-conversation agent-settings override (sparse diff over the user's
+    # settings, credential-free). NULL means the conversation followed the
+    # user's global agent_settings when it started.
+    agent_settings_diff: Mapped[dict | None] = mapped_column(
+        create_json_type_decorator(dict), nullable=True
+    )
+
     conversation_version: Mapped[str] = mapped_column(
         String, nullable=False, default='V0', index=True
     )
@@ -377,6 +384,7 @@ class SQLAppConversationInfoService(AppConversationInfoService):
             per_turn_token=usage.per_turn_token,
             llm_model=info.llm_model,
             agent_kind=info.agent_kind,
+            agent_settings_diff=info.agent_settings_diff,
             conversation_version='V1',
             sandbox_id=info.sandbox_id,
             parent_conversation_id=(
@@ -595,6 +603,7 @@ class SQLAppConversationInfoService(AppConversationInfoService):
             pr_number=stored.pr_number or [],
             llm_model=stored.llm_model,
             agent_kind=stored.agent_kind or 'openhands',
+            agent_settings_diff=stored.agent_settings_diff,
             metrics=metrics,
             parent_conversation_id=(
                 UUID(stored.parent_conversation_id)

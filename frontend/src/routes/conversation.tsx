@@ -20,6 +20,7 @@ import { ConversationSubscriptionsProvider } from "#/context/conversation-subscr
 
 import { ConversationMain } from "#/components/features/conversation/conversation-main/conversation-main";
 import { ConversationNameWithStatus } from "#/components/features/conversation/conversation-name-with-status";
+import { ConversationRepoSelector } from "#/components/features/conversation/conversation-repo-selector";
 import { ArchivedConversationView } from "#/components/features/conversation/archived-conversation-view";
 
 import { ConversationTabs } from "#/components/features/conversation/conversation-tabs/conversation-tabs";
@@ -118,7 +119,10 @@ function AppContent() {
           className="p-3 md:p-0 flex flex-col h-full gap-3"
         >
           <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4.5 pt-2 lg:pt-0">
-            <ConversationNameWithStatus />
+            <div className="flex flex-col lg:flex-row lg:items-center gap-2">
+              <ConversationNameWithStatus />
+              <ConversationRepoSelector />
+            </div>
             <ConversationTabs />
           </div>
 

@@ -34,6 +34,8 @@ from openhands.app_server.app_conversation.app_conversation_models import (
     AppConversationUpdateRequest,
     AppSendMessageRequest,
     AppSendMessageResponse,
+    CheckoutRepositoryRequest,
+    CheckoutRepositoryResponse,
     GetHooksResponse,
     HookDefinitionResponse,
     HookEventResponse,
@@ -50,6 +52,7 @@ from openhands.app_server.app_conversation.app_conversation_service import (
 )
 from openhands.app_server.app_conversation.app_conversation_service_base import (
     AppConversationServiceBase,
+    RepositoryCheckoutError,
     get_project_dir,
 )
 from openhands.app_server.app_conversation.app_conversation_start_task_service import (
@@ -89,6 +92,7 @@ from openhands.app_server.utils.dependencies import get_dependencies
 from openhands.app_server.utils.docker_utils import (
     replace_localhost_hostname_for_docker,
 )
+from openhands.app_server.utils.feature_flags import acp_enabled
 from openhands.sdk.skills import KeywordTrigger, TaskTrigger
 from openhands.sdk.workspace.remote.async_remote_workspace import AsyncRemoteWorkspace
 
@@ -361,6 +365,27 @@ async def batch_get_app_conversations(
     return app_conversations
 
 
+def _validate_agent_settings_diff_allowed(
+    start_request: AppConversationStartRequest,
+) -> None:
+    """Reject per-conversation ACP engine overrides when ACP is disabled.
+
+    Credential/size validation already ran in the request model; this is the
+    HTTP-level feature gate so callers get a clear 400 instead of a failed
+    start task. The service re-checks as defense in depth for non-HTTP entry
+    points.
+    """
+    diff = start_request.agent_settings_diff
+    if diff and diff.get('agent_kind') == 'acp' and not acp_enabled():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                'ACP agent engines are disabled on this server. '
+                'Set ENABLE_ACP=true to allow per-conversation ACP overrides.'
+            ),
+        )
+
+
 @router.post('')
 async def start_app_conversation(
     request: Request,
@@ -372,6 +397,8 @@ async def start_app_conversation(
         app_conversation_service_dependency
     ),
 ) -> AppConversationStartTask:
+    _validate_agent_settings_diff_allowed(start_request)
+
     # Because we are processing after the request finishes, keep the db connection open
     set_db_session_keep_open(request.state, True)
     set_httpx_client_keep_open(request.state, True)
@@ -866,6 +893,114 @@ async def switch_conversation_acp_model(
     return Success()
 
 
+@router.post(
+    '/{conversation_id}/checkout-repository',
+    responses={
+        400: {'description': 'Invalid repository/branch, or missing git token'},
+        404: {'description': 'Conversation or sandbox not found'},
+        409: {'description': 'Sandbox is paused; resume it before switching repos'},
+        502: {'description': 'Clone or checkout failed in the sandbox'},
+    },
+)
+async def checkout_repository(
+    conversation_id: UUID,
+    request: CheckoutRepositoryRequest,
+    app_conversation_service: AppConversationService = (
+        app_conversation_service_dependency
+    ),
+    sandbox_service: SandboxService = sandbox_service_dependency,
+    sandbox_spec_service: SandboxSpecService = sandbox_spec_service_dependency,
+) -> CheckoutRepositoryResponse:
+    """Check a repository out into a running conversation's workspace.
+
+    Clones the repository side by side with any existing checkouts (never
+    destroying existing work), runs the repo's `.openhands/` setup script and
+    git hooks, and updates the conversation's repository metadata — all
+    without restarting the sandbox. Runs synchronously; shallow clones
+    typically complete in seconds.
+    """
+    ctx = await _get_agent_server_context(
+        conversation_id,
+        app_conversation_service,
+        sandbox_service,
+        sandbox_spec_service,
+    )
+    if isinstance(ctx, JSONResponse):
+        raise HTTPException(
+            status_code=ctx.status_code,
+            detail=f'Conversation {conversation_id} is not reachable',
+        )
+    if ctx is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail='Sandbox is paused; resume it before switching repositories.',
+        )
+
+    if not isinstance(app_conversation_service, AppConversationServiceBase):
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail='Repository checkout is not supported by this server configuration.',
+        )
+
+    # The conversation's workspace root was pinned at creation (grouping
+    # strategies nest it under the conversation id); fall back to the sandbox
+    # spec's working_dir for legacy conversations without the tag.
+    working_dir = (
+        ctx.conversation.tags.get(ARCHIVE_WORKSPACE_PATH_TAG_KEY)
+        or ctx.sandbox_spec.working_dir
+    )
+    workspace = AsyncRemoteWorkspace(
+        host=ctx.agent_server_url,
+        api_key=ctx.session_api_key,
+        working_dir=working_dir,
+    )
+
+    try:
+        project_dir = await app_conversation_service.checkout_repository_into_workspace(
+            workspace,
+            request.repository,
+            request.branch,
+            request.git_provider,
+            ctx.sandbox,
+        )
+    except RepositoryCheckoutError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=str(exc),
+        )
+    except ValueError as exc:
+        # Missing git token / invalid repository or branch name.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        )
+
+    # Persist the switch so the conversation header/metadata reflect the new
+    # repository on next load.
+    await app_conversation_service.update_app_conversation(
+        conversation_id,
+        AppConversationUpdateRequest(
+            selected_repository=request.repository,
+            selected_branch=request.branch,
+            git_provider=request.git_provider,
+        ),
+    )
+
+    logger.info(
+        'Checked out repository %r (branch=%r) into conversation %s at %s',
+        request.repository,
+        request.branch,
+        conversation_id,
+        project_dir,
+    )
+
+    return CheckoutRepositoryResponse(
+        project_dir=project_dir,
+        repository=request.repository,
+        branch=request.branch,
+    )
+
+
 async def _finalize_sandbox_delete(
     sandbox_service: SandboxService,
     app_conversation_info_service: AppConversationInfoService,
@@ -1026,6 +1161,7 @@ async def stream_app_conversation_start(
     """Start an app conversation start task and stream updates from it.
     Leaves the connection open until either the conversation starts or there was an error
     """
+    _validate_agent_settings_diff_allowed(request)
     response = StreamingResponse(
         _stream_app_conversation_start(request, user_context),
         media_type='application/json',

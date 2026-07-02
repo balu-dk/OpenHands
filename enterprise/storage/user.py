@@ -34,6 +34,7 @@ class User(Base):
     role_id: Mapped[int | None] = mapped_column(ForeignKey('role.id'), nullable=True)
     accepted_tos: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     enable_sound_notifications: Mapped[bool | None] = mapped_column(nullable=True)
+    enable_browser_notifications: Mapped[bool | None] = mapped_column(nullable=True)
     language: Mapped[str | None] = mapped_column(String, nullable=True)
     user_consents_to_analytics: Mapped[bool | None] = mapped_column(nullable=True)
     email: Mapped[str | None] = mapped_column(String, nullable=True)

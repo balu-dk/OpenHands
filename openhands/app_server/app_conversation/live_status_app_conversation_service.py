@@ -23,6 +23,10 @@ from openhands.agent_server.models import (
     StartConversationRequest,
     TextContent,
 )
+from openhands.app_server.app_conversation.agent_settings_resolver import (
+    normalize_agent_settings_diff_for_persistence,
+    resolve_effective_agent_settings,
+)
 from openhands.app_server.app_conversation.app_conversation_info_service import (
     AppConversationInfoService,
 )
@@ -104,6 +108,7 @@ from openhands.app_server.user.user_models import UserInfo
 from openhands.app_server.utils.docker_utils import (
     replace_localhost_hostname_for_docker,
 )
+from openhands.app_server.utils.feature_flags import acp_enabled
 from openhands.app_server.utils.git import ensure_valid_git_branch_name
 from openhands.app_server.utils.import_utils import get_impl
 from openhands.app_server.utils.llm_metadata import (
@@ -122,7 +127,7 @@ from openhands.sdk.llm import LLM
 from openhands.sdk.llm.llm_profile_store import PROFILE_NAME_REGEX
 from openhands.sdk.plugin import PluginSource
 from openhands.sdk.secret import LookupSecret, StaticSecret
-from openhands.sdk.settings import ACPAgentSettings
+from openhands.sdk.settings import ACPAgentSettings, OpenHandsAgentSettings
 from openhands.sdk.subagent import get_registered_agent_definitions
 from openhands.sdk.tool.builtins import SwitchLLMTool
 from openhands.sdk.utils.redact import (
@@ -365,6 +370,27 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
         yield task
 
         try:
+            # Resolve the per-conversation agent-settings override before any
+            # expensive work so an invalid diff fails the task immediately.
+            # None means "follow the user's global settings" (legacy behavior).
+            user_info = await self.user_context.get_user_info()
+            agent_settings_override: (
+                OpenHandsAgentSettings | ACPAgentSettings | None
+            ) = None
+            if request.agent_settings_diff:
+                agent_settings_override = resolve_effective_agent_settings(
+                    user_info.agent_settings, request.agent_settings_diff
+                )
+                if (
+                    isinstance(agent_settings_override, ACPAgentSettings)
+                    and not isinstance(user_info.agent_settings, ACPAgentSettings)
+                    and not acp_enabled()
+                ):
+                    raise ValueError(
+                        'ACP agent engines are disabled on this server '
+                        '(set ENABLE_ACP=true to allow per-conversation ACP overrides)'
+                    )
+
             async for updated_task in self._wait_for_sandbox_start(task):
                 yield updated_task
 
@@ -432,6 +458,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
                     selected_branch=request.selected_branch,
                     plugins=request.plugins,
                     api_secrets=request.secrets,
+                    agent_settings_override=agent_settings_override,
                 )
             )
 
@@ -495,6 +522,9 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
             # archive captures the right directory without re-deriving the path
             # from settings (e.g. grouping) that may change before delete.
             tags[ARCHIVE_WORKSPACE_PATH_TAG_KEY] = working_dir
+            effective_agent_settings = (
+                agent_settings_override or user_info.agent_settings
+            )
             if request_agent.agent_kind == 'acp':
                 llm_model = request_agent.acp_model
                 agent_kind = 'acp'
@@ -502,12 +532,22 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
                 # can resolve a brand label ("Claude Code", "Codex", …) via
                 # the SDK registry without keeping a per-conversation column.
                 # Surfaced to the UI as the projected ``acp_server`` field.
-                acp_user = await self.user_context.get_user_info()
-                if isinstance(acp_user.agent_settings, ACPAgentSettings):
-                    tags[ACP_SERVER_TAG_KEY] = acp_user.agent_settings.acp_server
+                if isinstance(effective_agent_settings, ACPAgentSettings):
+                    tags[ACP_SERVER_TAG_KEY] = effective_agent_settings.acp_server
             else:
                 llm_model = request_agent.llm.model
                 agent_kind = 'openhands'
+
+            # Persist the override (normalized to pin the resolved engine) so
+            # forks and restarts rebuild this conversation with the same
+            # engine even if the user's global settings change later.
+            persisted_agent_settings_diff = None
+            if request.agent_settings_diff and agent_settings_override is not None:
+                persisted_agent_settings_diff = (
+                    normalize_agent_settings_diff_for_persistence(
+                        request.agent_settings_diff, agent_settings_override
+                    )
+                )
 
             app_conversation_info = AppConversationInfo(
                 id=info.id,
@@ -516,6 +556,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
                 created_by_user_id=user_id,
                 llm_model=llm_model,
                 agent_kind=agent_kind,
+                agent_settings_diff=persisted_agent_settings_diff,
                 tags=tags,
                 # Git parameters
                 selected_repository=request.selected_repository,
@@ -1074,6 +1115,12 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
         if not request.llm_model and parent_info.llm_model:
             request.llm_model = parent_info.llm_model
 
+        # Inherit the per-conversation agent-engine override so forks and
+        # sub-conversations keep the parent's engine (e.g. an ACP/Claude Code
+        # session forks into another ACP session) unless explicitly overridden.
+        if request.agent_settings_diff is None and parent_info.agent_settings_diff:
+            request.agent_settings_diff = parent_info.agent_settings_diff
+
     def _apply_suggested_task(self, request: AppConversationStartRequest) -> None:
         """Apply suggested task defaults to the start request."""
         suggested_task: SuggestedTask | None = request.suggested_task
@@ -1212,10 +1259,16 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
 
         return secrets, enrichment.system_message_suffix
 
-    def _configure_llm(self, user: UserInfo, llm_model: str | None) -> LLM:
+    def _configure_llm(
+        self,
+        user: UserInfo,
+        llm_model: str | None,
+        agent_settings: OpenHandsAgentSettings | ACPAgentSettings | None = None,
+    ) -> LLM:
         """Configure LLM settings.
 
-        Starts from the user's saved LLM configuration and overrides only
+        Starts from the saved LLM configuration (the per-conversation
+        ``agent_settings`` when provided, else the user's) and overrides only
         the fields that the server needs to resolve (model name, base URL,
         and usage ID).  All other user-configured fields (e.g.
         ``reasoning_effort``, ``extended_thinking_budget``, ``drop_params``)
@@ -1224,27 +1277,33 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
         Args:
             user: User information containing LLM preferences
             llm_model: Optional specific model to use, falls back to user default
+            agent_settings: Optional per-conversation agent settings taking
+                precedence over ``user.agent_settings``
 
         Returns:
             Configured LLM instance
         """
+        settings = agent_settings or user.agent_settings
         model: str = (
-            llm_model
-            or user.agent_settings.llm.model
-            or LLM.model_fields['model'].default
+            llm_model or settings.llm.model or LLM.model_fields['model'].default
         )
 
         base_url = resolve_provider_llm_base_url(
             model,
-            user.agent_settings.llm.base_url,
+            settings.llm.base_url,
             provider_base_url=self.openhands_provider_base_url,
         )
 
-        return user.agent_settings.llm.model_copy(
+        # A per-conversation override never carries credentials (the diff
+        # validator rejects them), so fall back to the user's saved key when
+        # the override's LLM has none.
+        api_key = settings.llm.api_key or user.agent_settings.llm.api_key
+
+        return settings.llm.model_copy(
             update={
                 'model': model,
                 'base_url': base_url,
-                'api_key': user.agent_settings.llm.api_key,
+                'api_key': api_key,
                 'usage_id': 'agent',
                 # Force streaming on (the SDK LLM defaults stream=False).
                 'stream': True,
@@ -1280,18 +1339,24 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
             mcp_servers['default']['headers']['X-Session-API-Key'] = mcp_api_key
 
     def _merge_custom_mcp_config(
-        self, mcp_servers: dict[str, Any], user: UserInfo
+        self,
+        mcp_servers: dict[str, Any],
+        user: UserInfo,
+        agent_settings: OpenHandsAgentSettings | ACPAgentSettings | None = None,
     ) -> None:
         """Merge custom MCP configuration from user settings.
 
         Args:
             mcp_servers: Dictionary to add servers to
             user: User information containing custom MCP config
+            agent_settings: Optional per-conversation agent settings taking
+                precedence over ``user.agent_settings``
         """
-        if isinstance(user.agent_settings, ACPAgentSettings):
+        settings = agent_settings or user.agent_settings
+        if isinstance(settings, ACPAgentSettings):
             return
 
-        sdk_mcp = user.agent_settings.mcp_config
+        sdk_mcp = settings.mcp_config
         if not sdk_mcp or not sdk_mcp.mcpServers:
             return
 
@@ -1319,7 +1384,11 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
             )
 
     async def _configure_llm_and_mcp(
-        self, user: UserInfo, llm_model: str | None, conversation_id: UUID
+        self,
+        user: UserInfo,
+        llm_model: str | None,
+        conversation_id: UUID,
+        agent_settings: OpenHandsAgentSettings | ACPAgentSettings | None = None,
     ) -> tuple[LLM, dict]:
         """Configure LLM and MCP (Model Context Protocol) settings.
 
@@ -1327,12 +1396,14 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
             user: User information containing LLM preferences
             llm_model: Optional specific model to use, falls back to user default
             conversation_id: Conversation ID forwarded to the OpenHands MCP server
+            agent_settings: Optional per-conversation agent settings taking
+                precedence over ``user.agent_settings``
 
         Returns:
             Tuple of (configured LLM instance, MCP config dictionary)
         """
         # Configure LLM
-        llm = self._configure_llm(user, llm_model)
+        llm = self._configure_llm(user, llm_model, agent_settings)
 
         # Configure MCP - SDK expects format: {'mcpServers': {'server_name': {...}}}
         mcp_servers: dict[str, Any] = {}
@@ -1341,7 +1412,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
         await self._add_system_mcp_servers(mcp_servers, conversation_id)
 
         # Merge custom servers from user settings
-        self._merge_custom_mcp_config(mcp_servers, user)
+        self._merge_custom_mcp_config(mcp_servers, user, agent_settings)
 
         # Wrap in the mcpServers structure required by the SDK
         mcp_config = {'mcpServers': mcp_servers} if mcp_servers else {}
@@ -1585,6 +1656,9 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
         selected_branch: str | None = None,
         plugins: list[PluginSpec] | None = None,
         api_secrets: dict[str, SecretStr] | None = None,
+        agent_settings_override: OpenHandsAgentSettings
+        | ACPAgentSettings
+        | None = None,
     ) -> StartConversationRequest:
         """Build a complete StartConversationRequest for a user.
 
@@ -1613,12 +1687,18 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
                 These are merged with existing secrets (from database
                 and git providers), with API-provided secrets taking
                 precedence.
+            agent_settings_override: Optional per-conversation agent settings
+                (already resolved from the request's ``agent_settings_diff``).
+                Takes precedence over the user's saved ``agent_settings`` so
+                the engine choice binds to the conversation, not the user.
         """
         user = await self.user_context.get_user_info()
+        effective_agent_settings = agent_settings_override or user.agent_settings
 
         # Route ACP agent settings to the ACP-specific builder
-        if isinstance(user.agent_settings, ACPAgentSettings):
+        if isinstance(effective_agent_settings, ACPAgentSettings):
             acp_request = await self._build_acp_start_conversation_request(
+                acp_settings=effective_agent_settings,
                 sandbox=sandbox,
                 conversation_id=conversation_id,
                 initial_message=initial_message,
@@ -1679,7 +1759,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
 
         # --- LLM + MCP -----------------------------------------------------
         llm, mcp_config = await self._configure_llm_and_mcp(
-            user, llm_model, conversation_id
+            user, llm_model, conversation_id, agent_settings=effective_agent_settings
         )
 
         # --- system_message_suffix (planning-agent prefix) ------------------
@@ -1712,15 +1792,15 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
             register_builtins_agents(enable_browser=True)
             tools = get_default_tools(
                 enable_browser=True,
-                enable_sub_agents=user.agent_settings.enable_sub_agents,
+                enable_sub_agents=effective_agent_settings.enable_sub_agents,
             )
-            if user.agent_settings.enable_sub_agents:
+            if effective_agent_settings.enable_sub_agents:
                 agent_definitions = list(get_registered_agent_definitions())
 
         # --- build AgentSettings and create agent ---------------------------
         from fastmcp.mcp_config import MCPConfig
 
-        configured_agent_settings = user.agent_settings.model_copy(
+        configured_agent_settings = effective_agent_settings.model_copy(
             update={
                 'llm': llm,
                 'tools': tools,
@@ -1877,6 +1957,7 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
 
     async def _build_acp_start_conversation_request(
         self,
+        acp_settings: ACPAgentSettings,
         sandbox: SandboxInfo,
         conversation_id: UUID,
         initial_message: SendMessageRequest | None,
@@ -1903,6 +1984,9 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
         OpenHands/agent-canvas#1039).
 
         Args:
+            acp_settings: The ACP agent settings this conversation should run
+                with (the per-conversation override when one was supplied,
+                otherwise the user's saved settings)
             sandbox: Sandbox information
             conversation_id: Unique conversation identifier
             initial_message: Optional initial message to send
@@ -1983,9 +2067,6 @@ class LiveStatusAppConversationService(AppConversationServiceBase):
         )
 
         # --- build the ACP agent ------------------------------------------
-        acp_settings = user.agent_settings  # already verified to be ACPAgentSettings
-        assert isinstance(acp_settings, ACPAgentSettings)
-
         # Isolate the CLI data dir onto the durable /workspace tree so the SDK
         # self-resumes the provider session (session/load from base_state.json)
         # across pause/resume — matching the regular-agent lifecycle (#1274).

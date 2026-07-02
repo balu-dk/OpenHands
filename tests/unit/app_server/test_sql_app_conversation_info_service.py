@@ -214,6 +214,48 @@ class TestSQLAppConversationInfoService:
         assert retrieved_info.metrics == original_info.metrics
 
     @pytest.mark.asyncio
+    async def test_round_trip_agent_settings_diff(
+        self, service: SQLAppConversationInfoService
+    ):
+        """The per-conversation engine override survives a save/load cycle."""
+        diff = {
+            'agent_kind': 'acp',
+            'acp_server': 'claude-code',
+            'acp_model': 'sonnet',
+        }
+        info = AppConversationInfo(
+            id=uuid4(),
+            created_by_user_id='engine_user',
+            sandbox_id='engine_sandbox',
+            agent_kind='acp',
+            agent_settings_diff=diff,
+        )
+
+        await service.save_app_conversation_info(info)
+        retrieved = await service.get_app_conversation_info(info.id)
+
+        assert retrieved is not None
+        assert retrieved.agent_kind == 'acp'
+        assert retrieved.agent_settings_diff == diff
+
+    @pytest.mark.asyncio
+    async def test_agent_settings_diff_defaults_to_none(
+        self, service: SQLAppConversationInfoService
+    ):
+        """Legacy conversations (no override) round-trip as None."""
+        info = AppConversationInfo(
+            id=uuid4(),
+            created_by_user_id='legacy_user',
+            sandbox_id='legacy_sandbox',
+        )
+
+        await service.save_app_conversation_info(info)
+        retrieved = await service.get_app_conversation_info(info.id)
+
+        assert retrieved is not None
+        assert retrieved.agent_settings_diff is None
+
+    @pytest.mark.asyncio
     async def test_round_trip_with_minimal_fields(
         self, service: SQLAppConversationInfoService
     ):

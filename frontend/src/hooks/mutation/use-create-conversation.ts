@@ -16,6 +16,9 @@ interface CreateConversationVariables {
   parentConversationId?: string;
   agentType?: "default" | "plan";
   plugins?: PluginSpec[];
+  // Per-conversation agent-engine override, e.g.
+  // { agent_kind: "acp", acp_server: "claude-code" }
+  agentSettingsDiff?: Record<string, unknown>;
 }
 
 // Response type for V1 conversations
@@ -43,6 +46,7 @@ export const useCreateConversation = () => {
         parentConversationId,
         agentType,
         plugins,
+        agentSettingsDiff,
       } = variables;
 
       // Use V1 API - creates a conversation start task
@@ -57,6 +61,9 @@ export const useCreateConversation = () => {
         parentConversationId,
         agentType,
         plugins,
+        undefined, // sandbox_id
+        undefined, // llm_model
+        agentSettingsDiff,
       );
 
       // Return a special task ID that the frontend will recognize

@@ -3,7 +3,7 @@ from enum import Enum
 from typing import Any, Literal
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, Field, SecretStr, computed_field
+from pydantic import BaseModel, Field, SecretStr, computed_field, field_validator
 
 from openhands.agent_server.models import (
     ImageContent,
@@ -116,6 +116,11 @@ class AppConversationInfo(BaseModel):
     llm_model: str | None = None
     agent_kind: str = 'openhands'
 
+    # Per-conversation agent-settings override, normalized at start time to
+    # pin the resolved engine (see agent_settings_resolver). None means the
+    # conversation followed the user's global settings when it started.
+    agent_settings_diff: dict[str, Any] | None = None
+
     metrics: MetricsSnapshot | None = None
 
     parent_conversation_id: OpenHandsUUID | None = None
@@ -212,6 +217,20 @@ class AppConversationStartRequest(OpenHandsModel):
     parent_conversation_id: OpenHandsUUID | None = None
     agent_type: AgentType = Field(default=AgentType.DEFAULT)
 
+    agent_settings_diff: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            'Per-conversation agent-settings override in the same sparse '
+            "nested-dict shape as the settings API. Applied over the user's "
+            'saved agent_settings with the SDK variant-aware merge, so it can '
+            'select a different agent engine (e.g. agent_kind="acp" with '
+            'acp_server="claude-code") for this conversation only. Credential '
+            'keys (api_key, secrets) are rejected — pass secrets via the '
+            'secrets field or the user secrets store instead. When omitted, '
+            "the conversation follows the user's global settings."
+        ),
+    )
+
     public: bool | None = None
 
     # Plugin parameters - for loading remote plugins into the conversation
@@ -234,6 +253,19 @@ class AppConversationStartRequest(OpenHandsModel):
             'Warning: Providing a secret that already exists will silently override it.'
         ),
     )
+
+    @field_validator('agent_settings_diff')
+    @classmethod
+    def _validate_agent_settings_diff(
+        cls, value: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        if value is not None:
+            from openhands.app_server.app_conversation.agent_settings_resolver import (
+                validate_agent_settings_diff,
+            )
+
+            validate_agent_settings_diff(value)
+        return value
 
 
 class AppConversationUpdateRequest(BaseModel):
@@ -367,6 +399,43 @@ class SwitchProfileRequest(BaseModel):
         description='Name of a profile previously saved via /api/v1/settings/profiles.',
         min_length=1,
     )
+
+
+class CheckoutRepositoryRequest(BaseModel):
+    """Request to check a repository out into a running conversation's workspace.
+
+    The repository is cloned side by side with any existing checkouts (same
+    layout as conversation start: ``{working_dir}/{repo_name}``), so switching
+    projects never destroys existing work. The conversation's
+    ``selected_repository``/``selected_branch`` metadata is updated on success.
+    """
+
+    repository: str = Field(
+        ...,
+        min_length=1,
+        description='Repository to check out, e.g. "owner/repo".',
+    )
+    git_provider: ProviderType | None = Field(
+        default=None,
+        description='Git provider of the repository (defaults to the stored token match).',
+    )
+    branch: str | None = Field(
+        default=None,
+        description=(
+            'Branch to check out. When omitted, the default branch is cloned '
+            'onto a fresh openhands-workspace-* branch.'
+        ),
+    )
+
+
+class CheckoutRepositoryResponse(BaseModel):
+    """Response after checking a repository out into a workspace."""
+
+    project_dir: str = Field(
+        description='Absolute path of the checked-out repository inside the workspace.'
+    )
+    repository: str
+    branch: str | None = None
 
 
 class SwitchAcpModelRequest(BaseModel):
