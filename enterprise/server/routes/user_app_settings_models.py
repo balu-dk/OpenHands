@@ -32,6 +32,7 @@ class UserAppSettingsResponse(BaseModel):
     language: str | None = None
     user_consents_to_analytics: bool | None = None
     enable_sound_notifications: bool | None = None
+    enable_browser_notifications: bool | None = None
     git_user_name: str | None = None
     git_user_email: EmailStr | None = None
     git_full_clone: bool | None = None
@@ -43,6 +44,7 @@ class UserAppSettingsResponse(BaseModel):
             language=user.language,
             user_consents_to_analytics=user.user_consents_to_analytics,
             enable_sound_notifications=user.enable_sound_notifications,
+            enable_browser_notifications=user.enable_browser_notifications,
             git_user_name=user.git_user_name,
             git_user_email=user.git_user_email,
             git_full_clone=user.git_full_clone,
@@ -55,6 +57,7 @@ class UserAppSettingsUpdate(BaseModel):
     language: str | None = None
     user_consents_to_analytics: bool | None = None
     enable_sound_notifications: bool | None = None
+    enable_browser_notifications: bool | None = None
     git_user_name: str | None = None
     git_user_email: EmailStr | None = None
     git_full_clone: bool | None = None

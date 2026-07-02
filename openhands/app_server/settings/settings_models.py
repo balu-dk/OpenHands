@@ -134,6 +134,7 @@ class Settings(BaseModel):
     # Planned to be removed from settings - import Secrets lazily to avoid circular imports
     secrets_store: Annotated[Any, Field(frozen=True)] = Field(default=None)
     enable_sound_notifications: bool = False
+    enable_browser_notifications: bool = False
     enable_proactive_conversation_starters: bool = True
     user_consents_to_analytics: bool | None = None
     sandbox_base_container_image: str | None = None

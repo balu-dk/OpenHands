@@ -6,7 +6,7 @@ import os
 import zipfile
 from datetime import datetime
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import ANY, AsyncMock, Mock, patch
 from uuid import uuid4
 
 import pytest
@@ -1064,9 +1064,19 @@ class TestLiveStatusAppConversationService:
         self.service._setup_secrets_for_git_providers.assert_called_once_with(
             self.mock_user
         )
+        # agent_settings is compared with ANY because _TestUserInfo builds a
+        # fresh settings object per access (current_datetime differs); the
+        # engine identity is asserted separately.
         self.service._configure_llm_and_mcp.assert_called_once_with(
-            self.mock_user, 'gpt-4', test_conversation_id
+            self.mock_user,
+            'gpt-4',
+            test_conversation_id,
+            agent_settings=ANY,
         )
+        passed_settings = self.service._configure_llm_and_mcp.call_args.kwargs[
+            'agent_settings'
+        ]
+        assert passed_settings.agent_kind == 'openhands'
 
     @patch(
         'openhands.app_server.app_conversation.live_status_app_conversation_service.get_default_tools',
@@ -3818,6 +3828,7 @@ class TestBuildAcpStartConversationRequestSecrets:
         service.user_context.get_provider_tokens = AsyncMock(return_value=None)
         sandbox = Mock(spec=SandboxInfo)
         return service._build_acp_start_conversation_request(
+            acp_settings=user.agent_settings,
             sandbox=sandbox,
             conversation_id=uuid4(),
             initial_message=None,
@@ -4062,3 +4073,148 @@ class TestBuildAcpStartConversationRequestSecrets:
         request = await self._call_build(service, user, tmp_path)
 
         assert request.observability_metadata == {}
+
+
+class TestAgentSettingsOverrideRouting:
+    """Per-conversation ``agent_settings_override`` routes the request builder.
+
+    The override (resolved from a start request's ``agent_settings_diff``)
+    must take precedence over the user's saved ``agent_settings`` so the
+    engine binds to the conversation: an OpenHands-default user can run a
+    Claude Code (ACP) session and vice versa, concurrently.
+    """
+
+    @pytest.fixture
+    def service(self):
+        mock_user_context = Mock(spec=UserContext)
+        return LiveStatusAppConversationService(
+            init_git_in_empty_workspace=True,
+            user_context=mock_user_context,
+            app_conversation_info_service=Mock(),
+            app_conversation_start_task_service=Mock(),
+            event_callback_service=Mock(),
+            event_service=Mock(),
+            sandbox_service=Mock(),
+            sandbox_spec_service=Mock(),
+            jwt_service=Mock(),
+            pending_message_service=Mock(),
+            sandbox_startup_timeout=30,
+            sandbox_startup_poll_frequency=1,
+            max_num_conversations_per_sandbox=20,
+            httpx_client=Mock(),
+            web_url=None,
+            openhands_provider_base_url=None,
+            access_token_hard_timeout=None,
+            app_mode='test',
+        )
+
+    def _make_user(self, agent_settings):
+        user = _TestUserInfo(
+            id='user1',
+            llm_model='',
+            llm_base_url=None,
+            llm_api_key=None,
+            sandbox_grouping_strategy=SandboxGroupingStrategy.ADD_TO_ANY,
+            confirmation_mode=False,
+            security_analyzer=None,
+            search_api_key=None,
+            mcp_config=None,
+            disabled_skills=[],
+        )
+        user.agent_settings = agent_settings
+        return user
+
+    def _openhands_settings(self):
+        from openhands.sdk.settings import validate_agent_settings
+
+        return validate_agent_settings(
+            {'agent_kind': 'openhands', 'llm': {'model': 'claude-sonnet-4-5'}}
+        )
+
+    def _acp_settings(self, acp_server='claude-code'):
+        from openhands.sdk.settings import ACPAgentSettings
+
+        return ACPAgentSettings(
+            acp_server=acp_server,
+            llm=LLM(model='claude-sonnet-4-5'),
+        )
+
+    def _wire_user(self, service, user):
+        service.user_context.get_user_info = AsyncMock(return_value=user)
+        service.user_context.get_user_email = AsyncMock(return_value=None)
+        service.user_context.get_secrets = AsyncMock(return_value={})
+        service.user_context.get_provider_tokens = AsyncMock(return_value=None)
+
+    @pytest.mark.asyncio
+    async def test_acp_override_wins_over_openhands_user_settings(
+        self, service, tmp_path
+    ):
+        """OpenHands-default user + ACP override -> ACP conversation."""
+        user = self._make_user(self._openhands_settings())
+        self._wire_user(service, user)
+
+        request = await service._build_start_conversation_request_for_user(
+            sandbox=Mock(spec=SandboxInfo),
+            conversation_id=uuid4(),
+            initial_message=None,
+            system_message_suffix=None,
+            git_provider=None,
+            working_dir=str(tmp_path),
+            agent_settings_override=self._acp_settings(),
+        )
+
+        assert request.agent.agent_kind == 'acp'
+        # ACP path strips proxy creds from the subprocess env.
+        assert request.agent.llm.api_key is None
+
+    @pytest.mark.asyncio
+    @patch(
+        'openhands.app_server.app_conversation.live_status_app_conversation_service.get_default_tools',
+        return_value=[],
+    )
+    async def test_openhands_override_wins_over_acp_user_settings(
+        self, _mock_tools, service, tmp_path
+    ):
+        """ACP-default user + OpenHands override -> OpenHands conversation."""
+        user = self._make_user(self._acp_settings())
+        self._wire_user(service, user)
+
+        service._setup_conversation_secrets = AsyncMock(return_value=({}, None))
+        real_llm = LLM(model='claude-sonnet-4-5', api_key=SecretStr('key'))
+        service._configure_llm_and_mcp = AsyncMock(return_value=(real_llm, {}))
+
+        override = self._openhands_settings()
+        request = await service._build_start_conversation_request_for_user(
+            sandbox=Mock(spec=SandboxInfo),
+            conversation_id=uuid4(),
+            initial_message=None,
+            system_message_suffix=None,
+            git_provider=None,
+            working_dir=str(tmp_path),
+            agent_settings_override=override,
+        )
+
+        assert request.agent.agent_kind == 'openhands'
+        # The effective (override) settings reach the LLM/MCP configuration.
+        service._configure_llm_and_mcp.assert_called_once()
+        assert (
+            service._configure_llm_and_mcp.call_args.kwargs['agent_settings']
+            is override
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_override_follows_user_settings(self, service, tmp_path):
+        """Without an override the user's saved (ACP) settings still apply."""
+        user = self._make_user(self._acp_settings())
+        self._wire_user(service, user)
+
+        request = await service._build_start_conversation_request_for_user(
+            sandbox=Mock(spec=SandboxInfo),
+            conversation_id=uuid4(),
+            initial_message=None,
+            system_message_suffix=None,
+            git_provider=None,
+            working_dir=str(tmp_path),
+        )
+
+        assert request.agent.agent_kind == 'acp'

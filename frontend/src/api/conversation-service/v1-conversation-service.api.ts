@@ -13,6 +13,7 @@ import type {
   V1AppConversationStartTaskPage,
   V1AppConversation,
   V1AppConversationPage,
+  V1CheckoutRepositoryResponse,
   GetSkillsResponse,
   GetHooksResponse,
   V1RuntimeConversationInfo,
@@ -72,6 +73,7 @@ class V1ConversationService {
     plugins?: PluginSpec[],
     sandbox_id?: string,
     llm_model?: string,
+    agent_settings_diff?: Record<string, unknown>,
   ): Promise<V1AppConversationStartTask> {
     const body: V1AppConversationStartRequest = {
       selected_repository: selectedRepository,
@@ -85,6 +87,7 @@ class V1ConversationService {
       plugins: plugins || null,
       sandbox_id: sandbox_id || null,
       llm_model: llm_model || null,
+      agent_settings_diff: agent_settings_diff || null,
     };
 
     // suggested_task implies the backend will construct the initial_message
@@ -103,6 +106,34 @@ class V1ConversationService {
     const { data } = await openHands.post<V1AppConversationStartTask>(
       "/api/v1/app-conversations",
       body,
+    );
+
+    return data;
+  }
+
+  /**
+   * Check a repository out into a running conversation's workspace.
+   * The repo is cloned side by side with existing checkouts (never destroys
+   * existing work) and the conversation's repository metadata is updated.
+   *
+   * @param conversationId The conversation ID
+   * @param repository Repository to check out, e.g. "owner/repo"
+   * @param gitProvider Git provider of the repository
+   * @param branch Optional branch to check out
+   */
+  static async checkoutRepository(
+    conversationId: string,
+    repository: string,
+    gitProvider?: Provider,
+    branch?: string,
+  ): Promise<V1CheckoutRepositoryResponse> {
+    const { data } = await openHands.post<V1CheckoutRepositoryResponse>(
+      `/api/v1/app-conversations/${conversationId}/checkout-repository`,
+      {
+        repository,
+        git_provider: gitProvider || null,
+        branch: branch || null,
+      },
     );
 
     return data;

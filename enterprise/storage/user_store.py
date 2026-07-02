@@ -1117,6 +1117,7 @@ class UserStore:
             else None,
             accepted_tos=user.accepted_tos,
             enable_sound_notifications=user.enable_sound_notifications,
+            enable_browser_notifications=user.enable_browser_notifications,
             language=user.language,
             user_consents_to_analytics=user.user_consents_to_analytics,
             email=user.email,

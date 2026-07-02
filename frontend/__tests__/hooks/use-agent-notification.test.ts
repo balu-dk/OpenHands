@@ -3,12 +3,18 @@ import { renderHook, act } from "@testing-library/react";
 import { useAgentNotification } from "#/hooks/use-agent-notification";
 import { AgentState } from "#/types/agent-state";
 import * as browserTabModule from "#/utils/browser-tab";
+import { showBrowserNotification } from "#/utils/browser-notifications";
 
 // Mock useSettings to control the sound notification setting
 vi.mock("#/hooks/query/use-settings", () => ({
   useSettings: vi.fn().mockReturnValue({
     data: { enable_sound_notifications: true },
   }),
+}));
+
+// Mock the OS-level notification layer
+vi.mock("#/utils/browser-notifications", () => ({
+  showBrowserNotification: vi.fn(),
 }));
 
 // Spy on browserTab methods
@@ -178,5 +184,53 @@ describe("useAgentNotification", () => {
       browserTabModule.browserTab.startNotification,
     ).not.toHaveBeenCalled();
     expect(mockPlay).not.toHaveBeenCalled();
+  });
+
+  it("triggers notification on critical ERROR state", () => {
+    const { rerender } = renderHook(
+      ({ state }) => useAgentNotification(state),
+      { initialProps: { state: AgentState.RUNNING } },
+    );
+
+    rerender({ state: AgentState.ERROR });
+
+    expect(
+      browserTabModule.browserTab.startNotification,
+    ).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows a browser notification when enabled and tab is not focused", async () => {
+    const { useSettings } = await import("#/hooks/query/use-settings");
+    vi.mocked(useSettings).mockReturnValue({
+      data: {
+        enable_sound_notifications: false,
+        enable_browser_notifications: true,
+      },
+    } as ReturnType<typeof useSettings>);
+
+    const { rerender } = renderHook(
+      ({ state }) => useAgentNotification(state),
+      { initialProps: { state: AgentState.RUNNING } },
+    );
+
+    rerender({ state: AgentState.FINISHED });
+
+    expect(showBrowserNotification).toHaveBeenCalledTimes(1);
+
+    // Restore
+    vi.mocked(useSettings).mockReturnValue({
+      data: { enable_sound_notifications: true },
+    } as ReturnType<typeof useSettings>);
+  });
+
+  it("does not show a browser notification when the setting is disabled", () => {
+    const { rerender } = renderHook(
+      ({ state }) => useAgentNotification(state),
+      { initialProps: { state: AgentState.RUNNING } },
+    );
+
+    rerender({ state: AgentState.FINISHED });
+
+    expect(showBrowserNotification).not.toHaveBeenCalled();
   });
 });

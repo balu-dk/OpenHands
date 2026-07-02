@@ -9,6 +9,7 @@ from openhands.app_server.integrations.jira_dc.config import (
 )
 from openhands.app_server.integrations.provider import ProviderHandler
 from openhands.app_server.integrations.service_types import ProviderType
+from openhands.app_server.utils.feature_flags import acp_enabled
 from openhands.app_server.web_client.web_client_config_injector import (
     WebClientConfigInjector,
 )
@@ -162,7 +163,8 @@ def _get_feature_flags() -> WebClientFeatureFlags:
     ENABLE_LINEAR, HIDE_USERS_PAGE, HIDE_BILLING_PAGE, HIDE_INTEGRATIONS_PAGE,
     HIDE_PERSONAL_WORKSPACES, ENABLE_ACP, and OH_ENABLE_ONBOARDING from
     environment. Each flag is True only if the corresponding env var is
-    exactly 'true', otherwise False.
+    exactly 'true', otherwise False. ENABLE_ACP is the exception: it goes
+    through the shared ``acp_enabled()`` helper, which also accepts '1'.
 
     OH_ALLOW_USER_LLM_CONFIGURATION is the exception: it defaults to 'true'
     when unset so SaaS and existing installs keep the BYOK editing UI.
@@ -182,7 +184,9 @@ def _get_feature_flags() -> WebClientFeatureFlags:
             'OH_ALLOW_USER_LLM_CONFIGURATION', 'true'
         )
         == 'true',
-        enable_acp=os.getenv('ENABLE_ACP', 'false') == 'true',
+        # Shared helper: API-level validation of per-conversation ACP
+        # overrides reads the same flag, so UI and API can't disagree.
+        enable_acp=acp_enabled(),
         enable_onboarding=os.getenv('OH_ENABLE_ONBOARDING', 'false') == 'true',
         enable_automations=os.getenv('ENABLE_AUTOMATIONS', 'true') == 'true',
     )

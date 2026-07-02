@@ -750,6 +750,10 @@ def _create_service_with_mock_user_context(
     methods_to_bind = ['_configure_git_user_settings']
     if bind_methods:
         methods_to_bind.extend(bind_methods)
+        # clone_or_init_git_repo delegates to the task-free clone core; bind it
+        # too so the real code path runs end to end.
+        if 'clone_or_init_git_repo' in methods_to_bind:
+            methods_to_bind.append('clone_git_repository')
         # Remove potential duplicates while keeping order
         methods_to_bind = list(dict.fromkeys(methods_to_bind))
 
@@ -763,8 +767,20 @@ def _create_service_with_mock_user_context(
 
 @pytest.fixture
 def mock_workspace():
-    """Create a mock workspace instance for testing."""
-    return MockWorkspace(working_dir='/workspace/project')
+    """Create a mock workspace instance for testing.
+
+    The `test -d {repo}/.git` existence probe fails (repo not yet cloned) so
+    the clone path is exercised; all other commands succeed.
+    """
+    workspace = MockWorkspace(working_dir='/workspace/project')
+
+    async def execute_command(command, cwd=None, timeout=None):
+        if command.startswith('test -d'):
+            return MockCommandResult(exit_code=1)
+        return MockCommandResult()
+
+    workspace.execute_command = AsyncMock(side_effect=execute_command)
+    return workspace
 
 
 @pytest.mark.asyncio

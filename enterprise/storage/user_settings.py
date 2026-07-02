@@ -32,6 +32,9 @@ class UserSettings(Base):
     enable_sound_notifications: Mapped[bool | None] = mapped_column(
         nullable=True, default=False
     )
+    enable_browser_notifications: Mapped[bool | None] = mapped_column(
+        nullable=True, default=False
+    )
     enable_proactive_conversation_starters: Mapped[bool] = mapped_column(
         nullable=False, default=True
     )

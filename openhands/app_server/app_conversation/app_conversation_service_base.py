@@ -53,6 +53,14 @@ PRE_COMMIT_HOOK = '.git/hooks/pre-commit'
 PRE_COMMIT_LOCAL = '.git/hooks/pre-commit.local'
 
 
+class RepositoryCheckoutError(Exception):
+    """A git clone/checkout into a workspace failed.
+
+    The message is safe to surface to API clients: it never includes raw git
+    stderr, which can contain the token-bearing authenticated remote URL.
+    """
+
+
 def get_project_dir(
     working_dir: str,
     selected_repository: str | None = None,
@@ -426,31 +434,110 @@ class AppConversationServiceBase(AppConversationService, ABC):
                 _logger.info('Not initializing a new git repository.')
             return
 
+        try:
+            await self.clone_git_repository(
+                workspace,
+                request.selected_repository,
+                request.selected_branch,
+                request.git_provider,
+                sandbox,
+                strict=False,
+            )
+        except RepositoryCheckoutError as exc:
+            # Preserve historical conversation-start behavior: a failed clone
+            # is logged but does not abort the start (the workspace stays
+            # usable and the agent can surface the problem to the user).
+            _logger.warning(f'Repository setup failed: {exc}')
+
+    async def clone_git_repository(
+        self,
+        workspace: AsyncRemoteWorkspace,
+        selected_repository: str,
+        selected_branch: str | None,
+        git_provider: ProviderType | None,
+        sandbox: SandboxInfo | None = None,
+        strict: bool = True,
+    ) -> Path:
+        """Clone a repository into ``workspace.working_dir`` and check out a branch.
+
+        Task-free core of :meth:`clone_or_init_git_repo`, also used to check
+        out additional repositories into an already-running conversation's
+        workspace. Repositories land side by side at
+        ``{working_dir}/{repo_name}`` (same layout as conversation start), so
+        switching projects never destroys an existing checkout.
+
+        If the repository directory already exists, it is NOT re-cloned or
+        reset; when a branch is requested we fetch it (best-effort) and check
+        it out. Local state is never overwritten.
+
+        Args:
+            strict: When True, raise :class:`RepositoryCheckoutError` on
+                clone/checkout failure. When False, log warnings instead
+                (conversation-start behavior).
+
+        Returns:
+            The repository directory path inside the workspace.
+        """
         user_info = await self.user_context.get_user_info()
         remote_repo_url: str = await self.user_context.get_authenticated_git_url(
-            request.selected_repository
+            selected_repository
         )
         if not remote_repo_url:
             raise ValueError('Missing either Git token or valid repository')
 
-        dir_name = request.selected_repository.split('/')[-1]
+        dir_name = selected_repository.split('/')[-1]
         quoted_remote_repo_url = shlex.quote(remote_repo_url)
         quoted_dir_name = shlex.quote(dir_name)
         git_dir = Path(workspace.working_dir) / dir_name
         azure_devops_bearer_token = await self._get_azure_devops_bearer_token_for_git(
-            request.git_provider,
+            git_provider,
             remote_repo_url,
         )
 
-        if request.selected_branch:
-            ensure_valid_git_branch_name(request.selected_branch)
+        if selected_branch:
+            ensure_valid_git_branch_name(selected_branch)
+
+        # Existing checkout: never re-clone or reset — fetch the requested
+        # branch (best-effort; the stored remote already carries auth from the
+        # original clone) and check it out.
+        existing = await workspace.execute_command(
+            f'test -d {quoted_dir_name}/.git', workspace.working_dir
+        )
+        if existing.exit_code == 0:
+            if selected_branch:
+                quoted_branch = shlex.quote(selected_branch)
+                fetch = await workspace.execute_command(
+                    f'git fetch --depth 1 origin {quoted_branch}', git_dir, 120
+                )
+                if fetch.exit_code:
+                    _logger.warning(
+                        'Git fetch of %s failed (continuing with local refs)',
+                        selected_branch,
+                    )
+                result = await workspace.execute_command(
+                    f'git checkout {quoted_branch}', git_dir
+                )
+                if result.exit_code:
+                    # Branch may only exist as FETCH_HEAD after a shallow fetch.
+                    result = await workspace.execute_command(
+                        f'git checkout -b {quoted_branch} FETCH_HEAD', git_dir
+                    )
+                if result.exit_code:
+                    message = (
+                        f'Could not check out branch {selected_branch!r} in '
+                        f'existing checkout of {selected_repository!r}'
+                    )
+                    if strict:
+                        raise RepositoryCheckoutError(message)
+                    _logger.warning(message)
+            return git_dir
 
         full_clone = bool(getattr(user_info, 'git_full_clone', False))
         clone_flags = ''
         if not full_clone:
             clone_flags = ' --depth 1'
-            if request.selected_branch:
-                clone_flags += f' --branch {shlex.quote(request.selected_branch)}'
+            if selected_branch:
+                clone_flags += f' --branch {shlex.quote(selected_branch)}'
 
         # Clone the repo - this is the slow part!
         if azure_devops_bearer_token:
@@ -469,19 +556,25 @@ class AppConversationServiceBase(AppConversationService, ABC):
             clone_command, workspace.working_dir, 120
         )
         if result.exit_code:
+            if strict:
+                # Never include stderr: it can echo the authenticated URL.
+                raise RepositoryCheckoutError(
+                    f'Git clone of {selected_repository!r} failed '
+                    f'(exit code {result.exit_code})'
+                )
             _logger.warning(f'Git clone failed: {result.stderr}')
         elif azure_devops_bearer_token:
             await self._configure_azure_devops_git_credential_helper(
                 workspace,
                 git_dir,
-                request.selected_repository,
+                selected_repository,
                 sandbox,
             )
 
         # Checkout the appropriate branch
-        if request.selected_branch:
+        if selected_branch:
             # Needed for full clones; harmless no-op after shallow clones with --branch.
-            checkout_command = f'git checkout {shlex.quote(request.selected_branch)}'
+            checkout_command = f'git checkout {shlex.quote(selected_branch)}'
         else:
             # Generate a random branch name to avoid conflicts
             random_str = base62.encodebytes(os.urandom(16))
@@ -491,7 +584,47 @@ class AppConversationServiceBase(AppConversationService, ABC):
             )
         result = await workspace.execute_command(checkout_command, git_dir)
         if result.exit_code:
+            if strict:
+                raise RepositoryCheckoutError(
+                    f'Git checkout in {selected_repository!r} failed '
+                    f'(exit code {result.exit_code})'
+                )
             _logger.warning(f'Git checkout failed: {result.stderr}')
+        return git_dir
+
+    async def checkout_repository_into_workspace(
+        self,
+        workspace: AsyncRemoteWorkspace,
+        selected_repository: str,
+        selected_branch: str | None,
+        git_provider: ProviderType | None,
+        sandbox: SandboxInfo | None = None,
+    ) -> str:
+        """Check a repository out into a running conversation's workspace.
+
+        Clones (or refreshes) the repository side by side with any existing
+        checkouts and runs the repo's `.openhands/` setup script and git hooks
+        — the same per-repo setup a conversation start performs — without
+        restarting the sandbox.
+
+        Returns:
+            The project directory of the checked-out repository.
+
+        Raises:
+            RepositoryCheckoutError: When the clone or branch checkout fails.
+        """
+        await self.clone_git_repository(
+            workspace,
+            selected_repository,
+            selected_branch,
+            git_provider,
+            sandbox,
+            strict=True,
+        )
+        project_dir = get_project_dir(workspace.working_dir, selected_repository)
+        await self.maybe_run_setup_script(workspace, project_dir)
+        await self.maybe_setup_git_hooks(workspace, project_dir)
+        return project_dir
 
     async def _get_azure_devops_bearer_token_for_git(
         self,

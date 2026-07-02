@@ -14,6 +14,8 @@ import { GitProviderDropdown } from "./git-provider-dropdown";
 import { GitBranchDropdown } from "./git-branch-dropdown";
 import { GitRepoDropdown } from "./git-repo-dropdown";
 import { useHomeStore } from "#/stores/home-store";
+import { useConfig } from "#/hooks/query/use-config";
+import { SettingsDropdownInput } from "../settings/settings-dropdown-input";
 
 interface RepositorySelectionFormProps {
   onRepoSelection: (repo: GitRepository | null) => void;
@@ -33,8 +35,13 @@ export function RepositorySelectionForm({
   );
   const [selectedProvider, setSelectedProvider] =
     React.useState<Provider | null>(null);
+  // Per-conversation agent engine: "default" follows the user's saved
+  // settings; "openhands" or an ACP provider key binds the engine to the
+  // new conversation only.
+  const [selectedEngine, setSelectedEngine] = React.useState<string>("default");
 
   const { providers } = useUserProviders();
+  const { data: config } = useConfig();
   const {
     addRecentRepository,
     setLastSelectedProvider,
@@ -91,6 +98,36 @@ export function RepositorySelectionForm({
   const handleBranchSelection = React.useCallback((branch: Branch | null) => {
     setSelectedBranch(branch);
   }, []);
+
+  const isAcpEnabled = !!config?.feature_flags?.enable_acp;
+  const acpProviders = React.useMemo(
+    () => config?.acp_providers ?? [],
+    [config?.acp_providers],
+  );
+
+  const engineItems = React.useMemo(
+    () => [
+      { key: "default", label: "Default (your agent settings)" },
+      { key: "openhands", label: "OpenHands (CodeAct)" },
+      ...acpProviders.map((provider) => ({
+        key: `acp:${provider.key}`,
+        label: provider.display_name,
+      })),
+    ],
+    [acpProviders],
+  );
+
+  const getAgentSettingsDiff = (): Record<string, unknown> | undefined => {
+    if (selectedEngine === "default") return undefined;
+    if (selectedEngine === "openhands") return { agent_kind: "openhands" };
+    if (selectedEngine.startsWith("acp:")) {
+      return {
+        agent_kind: "acp",
+        acp_server: selectedEngine.slice("acp:".length),
+      };
+    }
+    return undefined;
+  };
 
   // Render the provider dropdown
   const renderProviderSelector = () => {
@@ -174,6 +211,20 @@ export function RepositorySelectionForm({
         </div>
         {renderRepositorySelector()}
         {renderBranchSelector()}
+        {isAcpEnabled && acpProviders.length > 0 && (
+          <SettingsDropdownInput
+            testId="agent-engine-dropdown"
+            name="agent-engine"
+            items={engineItems}
+            placeholder="Agent engine"
+            selectedKey={selectedEngine}
+            isDisabled={isLoadingSettings}
+            isClearable={false}
+            onSelectionChange={(key) =>
+              setSelectedEngine(key ? String(key) : "default")
+            }
+          />
+        )}
       </div>
 
       <BrandButton
@@ -200,6 +251,7 @@ export function RepositorySelectionForm({
                 gitProvider: selectedRepository?.git_provider || "github",
                 branch: selectedBranch?.name || "main",
               },
+              agentSettingsDiff: getAgentSettingsDiff(),
             },
             {
               onSuccess: (data) =>

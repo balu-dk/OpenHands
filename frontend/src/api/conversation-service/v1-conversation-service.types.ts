@@ -68,6 +68,11 @@ export interface V1AppConversationStartRequest {
   parent_conversation_id?: string | null;
   agent_type?: "default" | "plan";
   plugins?: PluginSpec[] | null; // Plugins to load when starting the conversation
+  // Per-conversation agent-settings override (same sparse diff shape as the
+  // settings API). Binds the agent engine to this conversation, e.g.
+  // { agent_kind: "acp", acp_server: "claude-code" }. Credential keys are
+  // rejected by the backend.
+  agent_settings_diff?: Record<string, unknown> | null;
 }
 
 export type V1AppConversationStartTaskStatus =
@@ -132,6 +137,14 @@ export interface V1AppConversation {
 export interface V1AppConversationPage {
   items: V1AppConversation[];
   next_page_id: string | null;
+}
+
+// Response from checking a repository out into a running conversation's
+// workspace (POST /api/v1/app-conversations/{id}/checkout-repository)
+export interface V1CheckoutRepositoryResponse {
+  project_dir: string;
+  repository: string;
+  branch: string | null;
 }
 
 export interface Skill {

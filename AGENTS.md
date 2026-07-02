@@ -120,6 +120,21 @@ When working on a PR that requires design documents, scripts meant for developme
 - Feature implementations that need temporary planning docs
 - Any analysis that helps reviewers understand the PR but isn't needed long-term
 
+## Agent Context Docs (`docs/agent-context/`)
+
+Long-lived architecture notes and plans written for AI agents and developers picking up
+in-progress work without re-reading the codebase. Check this directory before starting
+work on a large feature — and add/update docs there when you make significant
+architectural discoveries or agree on a multi-step plan with the user.
+
+Current docs:
+- `docs/agent-context/architecture-session-engine.md` — how session state, sandboxes,
+  the agent-server contract, and agent-engine selection (OpenHands vs ACP/claude-code)
+  work in `openhands/app_server/`.
+- `docs/agent-context/multi-agent-refactor-plan.md` — living plan (with status
+  checkboxes) for the per-session multi-agent engine, in-conversation GitHub repo
+  selector, and notification system.
+
 ## Repository Structure
 Backend:
 - Located in the `openhands` directory
